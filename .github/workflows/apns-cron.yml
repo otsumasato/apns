@@ -1,83 +1,61 @@
-name: apns-cron
+name: one-time-apns
 on:
-  workflow_dispatch:
-    inputs:
-      device_token:
-        description: "Override device token (optional)"
-        required: false
-      env:
-        description: "APNs environment"
-        type: choice
-        options: 
-          - sandbox
-          - production
-        default: sandbox
-  schedule:
-    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 
 jobs:
   send:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install deps
+          python-version: '3.12'
+      
+      - name: Install JWT deps
         run: |
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
-
-      - name: Check secrets
-        env:
-          S_TEAM: ${{ secrets.APNS_TEAM_ID }}
-          S_KEY: ${{ secrets.APNS_KEY_ID }}
-          S_PEM: ${{ secrets.APN_SECRETS }}
-          S_TOPIC: ${{ secrets.APNS_TOPIC }}
-          S_DEVS: ${{ secrets.DEVICE_TOKENS }}
+      
+      - name: Send APNs via curl (HTTP/2)
+        shell: bash
         run: |
-          for v in S_TEAM S_KEY S_PEM S_TOPIC; do
-            if [ -z "${!v}" ]; then 
-              echo "❌ $v is EMPTY"
-              exit 1
-            else 
-              echo "✅ $v is set"
-            fi
-          done
-
-      - name: Build JWT
-        id: jwt
-        run: |
-          python3 << 'EOF'
-          import os
+          set -euo pipefail
+          echo "curl version (HTTP2 必須) ↓"
+          curl -V
+          
+          # JWT生成（インラインPython）
+          JWT=$(python3 - <<'PY'
           import time
           import jwt
           from cryptography.hazmat.primitives import serialization
           
-          TEAM_ID = "${{ secrets.APNS_TEAM_ID }}"
-          KEY_ID = "${{ secrets.APNS_KEY_ID }}"
-          PEM = """${{ secrets.APN_SECRETS }}"""
+          TEAM_ID = "8KVP2QK7BX"
+          KEY_ID = "5W5TK89GQC"
+          P8_PEM = """-----BEGIN PRIVATE KEY-----
+          MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
+          YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
+          LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
+          Mig6kHa4
+          -----END PRIVATE KEY-----"""
           
-          priv = serialization.load_pem_private_key(PEM.encode(), None)
+          priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
           token = jwt.encode(
-              {"iss": TEAM_ID, "iat": int(time.time())},
+              {"iss": TEAM_ID, "iat": int(time.time())}, 
               priv,
-              algorithm="ES256",
+              algorithm="ES256", 
               headers={"kid": KEY_ID}
           )
-          print(f"::set-output name=token::{token}")
-          EOF
-
-      - name: Send APNs
-        env:
-          JWT: ${{ steps.jwt.outputs.token }}
-          DEVICE_TOKEN: ${{ secrets.DEVICE_TOKENS }}
-          TOPIC: ${{ secrets.APNS_TOPIC }}
-        run: |
-          TOKEN="${DEVICE_TOKEN%%,*}"
+          print(token)
+          PY
+          )
+          
+          echo "Built JWT length = ${#JWT}"
+          
+          # APNs送信設定
+          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
+          TOPIC="net.momo.CoreBluetoothLE"
           HOST="https://api.sandbox.push.apple.com"
           
+          # APNsへHTTP/2で送信
           RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
             -H "authorization: bearer ${JWT}" \
             -H "apns-topic: ${TOPIC}" \
@@ -87,10 +65,17 @@ jobs:
             "${HOST}/3/device/${TOKEN}")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
           
+          echo "=== HTTP Status Code ==="
+          echo "$HTTP_CODE"
+          echo "=== Response Body ==="
+          echo "$BODY"
+          
+          # ステータスコードチェック
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
             echo "✅ Silent push sent successfully!"
           else
-            echo "❌ Failed: HTTP $HTTP_CODE"
+            echo "❌ Failed to send push. Status: $HTTP_CODE"
             exit 1
           fi
