@@ -1,6 +1,5 @@
 name: apns-cron
 on:
-  # 手動実行（Actions に Run workflow ボタンが出ます）
   workflow_dispatch:
     inputs:
       device_token:
@@ -9,149 +8,89 @@ on:
       env:
         description: "APNs environment"
         type: choice
-        options: [sandbox, production]
+        options: 
+          - sandbox
+          - production
         default: sandbox
-  # 5分ごとに自動実行
   schedule:
-    - cron: "*/5 * * * *"   # UTCで5分おき
+    - cron: "*/5 * * * *"
 
 jobs:
   send:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install deps (JWT only)
+      - name: Install deps
         run: |
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
 
-      # ✅ Secrets が"存在するかだけ"を確認（中身は表示しない）
-      - name: Check secrets presence (no values printed)
-        shell: bash
+      - name: Check secrets
         env:
           S_TEAM: ${{ secrets.APNS_TEAM_ID }}
           S_KEY: ${{ secrets.APNS_KEY_ID }}
-          S_PEM: ${{ secrets.APNS_P8_PEM || secrets.APN_SECRETS }}
+          S_PEM: ${{ secrets.APN_SECRETS }}
           S_TOPIC: ${{ secrets.APNS_TOPIC }}
           S_DEVS: ${{ secrets.DEVICE_TOKENS }}
         run: |
           for v in S_TEAM S_KEY S_PEM S_TOPIC; do
-            if [ -z "${!v}" ]; then echo "❌ $v is EMPTY"; exit 1; else echo "✅ $v is set"; fi
+            if [ -z "${!v}" ]; then 
+              echo "❌ $v is EMPTY"
+              exit 1
+            else 
+              echo "✅ $v is set"
+            fi
           done
-          if [ -z "${S_DEVS}" ]; then echo "ℹ️ DEVICE_TOKENS is empty (you can input device_token at runtime)"; else echo "✅ DEVICE_TOKENS is set"; fi
 
-      # 🔐 JWT を作成
-      - name: Build JWT (robust key loader)
+      - name: Build JWT
         id: jwt
-        shell: python
-        env:
-          APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
-          APNS_KEY_ID: ${{ secrets.APNS_KEY_ID }}
-          APNS_P8_PEM: ${{ secrets.APNS_P8_PEM }}
-          APN_SECRETS: ${{ secrets.APN_SECRETS }}
         run: |
+          python3 << 'EOF'
           import os
           import time
-          import base64
-          import re
           import jwt
           from cryptography.hazmat.primitives import serialization
           
-          TEAM_ID = os.environ["APNS_TEAM_ID"].strip()
-          KEY_ID = os.environ["APNS_KEY_ID"].strip()
-          S = os.environ.get("APNS_P8_PEM") or os.environ.get("APN_SECRETS") or ""
+          TEAM_ID = "${{ secrets.APNS_TEAM_ID }}"
+          KEY_ID = "${{ secrets.APNS_KEY_ID }}"
+          PEM = """${{ secrets.APN_SECRETS }}"""
           
-          def load_key(s):
-              s = s.strip().strip('`"\'')
-              # \n 文字列 → 実改行
-              if "\\n" in s and "BEGIN" in s:
-                  try:
-                      return serialization.load_pem_private_key(s.replace("\\n","\n").encode(), None)
-                  except Exception:
-                      pass
-              # PEM そのまま
-              if "BEGIN PRIVATE KEY" in s:
-                  return serialization.load_pem_private_key(s.encode(), None)
-              # Base64/URL-safe を試す（パディング補正）
-              compact = re.sub(r"\s+", "", s)
-              pad = "=" * ((4 - len(compact) % 4) % 4)
-              try:
-                  b = base64.b64decode(compact + pad, validate=False)
-              except Exception:
-                  from base64 import urlsafe_b64decode
-                  b = urlsafe_b64decode(compact + pad)
-              # デコード結果が PEM テキストなら PEM として、そうでなければ DER として読む
-              if b.startswith(b"-----BEGIN"):
-                  return serialization.load_pem_private_key(b, None)
-              return serialization.load_der_private_key(b, None)
-          
-          key = load_key(S)
-          token = jwt.encode({"iss": TEAM_ID, "iat": int(time.time())},
-                             key, algorithm="ES256", headers={"kid": KEY_ID})
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"token={token}\n")
+          priv = serialization.load_pem_private_key(PEM.encode(), None)
+          token = jwt.encode(
+              {"iss": TEAM_ID, "iat": int(time.time())},
+              priv,
+              algorithm="ES256",
+              headers={"kid": KEY_ID}
+          )
+          print(f"::set-output name=token::{token}")
+          EOF
 
-      # 🚀 APNs へ HTTP/2 で送信（curl 使用）
-      - name: Send APNs via HTTP/2 (curl)
-        shell: bash
+      - name: Send APNs
         env:
           JWT: ${{ steps.jwt.outputs.token }}
-          APNS_TOPIC: ${{ secrets.APNS_TOPIC }}
-          DEFAULT_TOKEN: ${{ secrets.DEVICE_TOKENS || vars.DEVICE_TOKENS }}
-          DEFAULT_ENV: ${{ secrets.APNS_ENV || vars.APNS_ENV }}
-          INPUT_TOKEN: ${{ inputs.device_token }}
-          INPUT_ENV: ${{ inputs.env }}
+          DEVICE_TOKEN: ${{ secrets.DEVICE_TOKENS }}
+          TOPIC: ${{ secrets.APNS_TOPIC }}
         run: |
-          set -euo pipefail
-          echo "curl version:"; curl -V
+          TOKEN="${DEVICE_TOKEN%%,*}"
+          HOST="https://api.sandbox.push.apple.com"
           
-          # トークン：入力 > Secrets/Vars。空白/改行除去、カンマ区切りなら先頭を使用
-          RAW="${INPUT_TOKEN:-${DEFAULT_TOKEN:-}}"
-          RAW="${RAW//$'\r'/}"; RAW="${RAW//$'\n'/}"
-          RAW="$(echo -n "$RAW" | tr -d '[:space:]')"
-          TOKEN="${RAW%%,*}"
-          if [ -z "${TOKEN:-}" ]; then
-            echo "❌ device_token が未設定（実行時入力 or DEVICE_TOKENS を設定）"; exit 1;
-          fi
-          
-          ENV="${INPUT_ENV:-${DEFAULT_ENV:-sandbox}}"
-          if [ "${ENV}" = "production" ]; then
-            HOST="https://api.push.apple.com"
-          else
-            HOST="https://api.sandbox.push.apple.com"
-          fi
-          
-          TICK_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          echo "{\"aps\":{\"content-available\":1},\"tick\":\"${TICK_UTC}\"}" > body.json
-          
-          echo "ENV=${ENV}  TOKEN(head)=${TOKEN:0:12}…  tick=${TICK_UTC}"
-          
-          set -x
-          curl --http2 -sS -D headers.txt \
+          RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
             -H "authorization: bearer ${JWT}" \
-            -H "apns-topic: ${APNS_TOPIC}" \
+            -H "apns-topic: ${TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
-            -d @body.json \
-            "${HOST}/3/device/${TOKEN}" \
-            -o response.json
-          set +x
+            -d '{"aps":{"content-available":1}}' \
+            "${HOST}/3/device/${TOKEN}")
           
-          echo "=== Response Headers ==="
-          cat headers.txt || true
-          echo "=== Response Body ==="
-          cat response.json || true
-          echo ""
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           
-          # Check HTTP status
-          STATUS=$(grep -E "^HTTP/2" headers.txt | awk '{print $2}')
-          if [ "$STATUS" = "200" ] || [ "$STATUS" = "204" ]; then
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
             echo "✅ Silent push sent successfully!"
           else
-            echo "❌ Failed: HTTP $STATUS"
+            echo "❌ Failed: HTTP $HTTP_CODE"
             exit 1
           fi
