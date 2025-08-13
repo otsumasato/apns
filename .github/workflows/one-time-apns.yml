@@ -23,19 +23,19 @@ jobs:
           
           # JWT生成（インラインPython）
           JWT=$(python3 - <<'PY'
-import time
-import jwt
-from cryptography.hazmat.primitives import serialization
-TEAM_ID = "8KVP2QK7BX"
-KEY_ID = "5W5TK89GQC"
-P8_PEM = """-----BEGIN PRIVATE KEY-----
-MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-Mig6kHa4
------END PRIVATE KEY-----"""
-priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-token = jwt.encode(
+          import time
+          import jwt
+          from cryptography.hazmat.primitives import serialization
+          TEAM_ID = "8KVP2QK7BX"
+          KEY_ID = "5W5TK89GQC"
+          P8_PEM = """-----BEGIN PRIVATE KEY-----
+          MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
+          YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
+          LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
+          Mig6kHa4
+          -----END PRIVATE KEY-----"""
+          priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
+          token = jwt.encode(
     {"iss": TEAM_ID, "iat": int(time.time())}, 
     priv,
     algorithm="ES256", 
