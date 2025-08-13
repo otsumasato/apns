@@ -1,6 +1,8 @@
-name: one-time-apns
+name: apns-every-5min
 on:
-  workflow_dispatch: {}
+  schedule:
+    - cron: '*/5 * * * *'  # 5分ごとに実行
+  workflow_dispatch: {}     # 手動実行も可能
 
 jobs:
   send:
@@ -27,7 +29,6 @@ jobs:
 import time
 import jwt
 from cryptography.hazmat.primitives import serialization
-
 TEAM_ID = "8KVP2QK7BX"
 KEY_ID = "5W5TK89GQC"
 P8_PEM = """-----BEGIN PRIVATE KEY-----
@@ -36,7 +37,6 @@ YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
 LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
 Mig6kHa4
 -----END PRIVATE KEY-----"""
-
 priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
 token = jwt.encode(
     {"iss": TEAM_ID, "iat": int(time.time())}, 
@@ -55,18 +55,22 @@ PY
           TOPIC="net.momo.CoreBluetoothLE"
           HOST="https://api.sandbox.push.apple.com"
           
-          # APNsへHTTP/2で送信
+          # タイムスタンプを追加
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          # APNsへHTTP/2で送信（タイムスタンプ付き）
           RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
             -H "authorization: bearer ${JWT}" \
             -H "apns-topic: ${TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
-            -d '{"aps":{"content-available":1}}' \
+            -d "{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}" \
             "${HOST}/3/device/${TOKEN}")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
           
+          echo "=== Sent at: ${TIMESTAMP} ==="
           echo "=== HTTP Status Code ==="
           echo "$HTTP_CODE"
           echo "=== Response Body ==="
