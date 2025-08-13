@@ -1,86 +1,43 @@
-name: apns-every-5min
+name: apns-cron
 on:
+  # 手動実行（Actions に Run workflow ボタンが出ます）
+  workflow_dispatch:
+    inputs:
+      device_token:
+        description: "Override device token (optional)"
+        required: false
+      env:
+        description: "APNs environment"
+        type: choice
+        options: [sandbox, production]
+        default: sandbox
+  # 5分ごとに自動実行
   schedule:
-    - cron: "*/5 * * * *"  # 5分ごと
-  workflow_dispatch: {}    # 手動実行も可能
+    - cron: "*/5 * * * *"   # UTCで5分おき
 
 jobs:
   send:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      
-      - name: Install JWT deps
+
+      - name: Install deps (JWT only)
         run: |
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
-      
-      - name: Send APNs via curl (HTTP/2)
+
+      # ✅ Secrets が"存在するかだけ"を確認（中身は表示しない）
+      - name: Check secrets presence (no values printed)
         shell: bash
+        env:
+          S_TEAM: ${{ secrets.APNS_TEAM_ID }}
+          S_KEY: ${{ secrets.APNS_KEY_ID }}
+          S_PEM: ${{ secrets.APNS_P8_PEM || secrets.APN_SECRETS }}
+          S_TOPIC: ${{ secrets.APNS_TOPIC }}
+          S_DEVS: ${{ secrets.DEVICE_TOKENS }}
         run: |
-          set -euo pipefail
-          echo "🕐 $(date '+%Y-%m-%d %H:%M:%S') - Starting silent push"
-          
-          # JWT生成（インラインPython）
-          JWT=$(python3 - <<'PY'
-import time
-import jwt
-from cryptography.hazmat.primitives import serialization
-
-TEAM_ID = "8KVP2QK7BX"
-KEY_ID = "5W5TK89GQC"
-P8_PEM = """-----BEGIN PRIVATE KEY-----
-MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-Mig6kHa4
------END PRIVATE KEY-----"""
-
-priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-token = jwt.encode(
-    {"iss": TEAM_ID, "iat": int(time.time())}, 
-    priv,
-    algorithm="ES256", 
-    headers={"kid": KEY_ID}
-)
-print(token)
-PY
-          )
-          
-          echo "Built JWT length = ${#JWT}"
-          
-          # APNs送信設定
-          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
-          TOPIC="net.momo.CoreBluetoothLE"
-          HOST="https://api.sandbox.push.apple.com"
-          
-          # タイムスタンプを含むペイロード
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          PAYLOAD="{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}"
-          
-          # APNsへHTTP/2で送信
-          RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
-            -H "authorization: bearer ${JWT}" \
-            -H "apns-topic: ${TOPIC}" \
-            -H "apns-push-type: background" \
-            -H "apns-priority: 5" \
-            -d "${PAYLOAD}" \
-            "${HOST}/3/device/${TOKEN}")
-          
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          
-          echo "=== HTTP Status Code ==="
-          echo "$HTTP_CODE"
-          echo "=== Response Body ==="
-          echo "$BODY"
-          
-          # ステータスコードチェック
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Silent push sent successfully at ${TIMESTAMP}!"
-          else
-            echo "❌ Failed to send push. Status: $HTTP_CODE"
-            exit 1
-          fi
+          for v in S_TEAM S_KEY S_PEM S_TOPIC; do
+            if [ -z "${!v}" ]; then echo "❌ $
