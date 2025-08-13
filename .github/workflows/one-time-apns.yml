@@ -1,9 +1,6 @@
-name: apns-every-5min
+name: one-time-apns
 on:
-  schedule:
-    - cron: '*/5 * * * *'  # 5分ごとに実行
-  workflow_dispatch: {}     # 手動実行も可能
-
+  workflow_dispatch: {}
 jobs:
   send:
     runs-on: ubuntu-latest
@@ -55,22 +52,18 @@ PY
           TOPIC="net.momo.CoreBluetoothLE"
           HOST="https://api.sandbox.push.apple.com"
           
-          # タイムスタンプを追加
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          
-          # APNsへHTTP/2で送信（タイムスタンプ付き）
+          # APNsへHTTP/2で送信
           RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
             -H "authorization: bearer ${JWT}" \
             -H "apns-topic: ${TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
-            -d "{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}" \
+            -d '{"aps":{"content-available":1}}' \
             "${HOST}/3/device/${TOKEN}")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
           
-          echo "=== Sent at: ${TIMESTAMP} ==="
           echo "=== HTTP Status Code ==="
           echo "$HTTP_CODE"
           echo "=== Response Body ==="
