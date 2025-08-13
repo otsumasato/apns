@@ -35,15 +35,7 @@ jobs:
           Mig6kHa4
           -----END PRIVATE KEY-----"""
           priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-          token = jwt.encode(
-    {"iss": TEAM_ID, "iat": int(time.time())}, 
-    priv,
-    algorithm="ES256", 
-    headers={"kid": KEY_ID}
-)
-print(token)
-PY
-          )
+          token = jwt.encode({"iss": TEAM_ID, "iat": int(time.time())}, priv,algorithm="ES256", headers={"kid": KEY_ID})print(token)PY)
           
           echo "Built JWT length = ${#JWT}"
           
