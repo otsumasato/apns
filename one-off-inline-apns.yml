@@ -1,7 +1,9 @@
 name: one-off-inline-apns
 on:
-  workflow_dispatch: {}   # ← これで Actions に「Run workflow」ボタンが出ます
-
+  workflow_dispatch:   #workflow_dispatch: {}   # ← これで Actions に「Run workflow」ボタンが出ます
+    inputs: …(省略)…
+  schedule:
+    - cron: "*/5 * * * *"   # 5分ごと
 jobs:
   send:
     runs-on: ubuntu-latest
