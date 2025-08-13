@@ -1,70 +1,89 @@
-name: one-time-apns
+name: apns-every-5min
+
 on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5分おき（UTC）
   workflow_dispatch: {}
 
 jobs:
   send:
     runs-on: ubuntu-latest
+
+    env:
+      TEAM_ID:    ${{ secrets.APNS_TEAM_ID }}
+      KEY_ID:     ${{ secrets.APNS_KEY_ID }}
+      TOPIC:      ${{ secrets.APNS_TOPIC }}
+      TOKEN:      ${{ secrets.DEVICE_TOKENS }}
+      P8_BASE64:  ${{ secrets.APNS_P8_BASE64 }}
+      HOST:       https://api.sandbox.push.apple.com   # 本番は https://api.push.apple.com
+
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install JWT deps
+      - name: Install deps
         run: |
+          set -euo pipefail
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
 
-      - name: Build JWT (dedent PEM)
-        id: jwt
-        shell: python
-        run: |
-          import time, os, jwt, textwrap
-          from cryptography.hazmat.primitives import serialization
-          TEAM_ID = "8KVP2QK7BX"
-          KEY_ID  = "5W5TK89GQC"
-          P8_PEM = textwrap.dedent("""\
-          -----BEGIN PRIVATE KEY-----
-          MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-          YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-          LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-          Mig6kHa4
-          -----END PRIVATE KEY-----""").strip()
-
-          priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-          token = jwt.encode({"iss": TEAM_ID, "iat": int(time.time())},
-                             priv, algorithm="ES256", headers={"kid": KEY_ID})
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"jwt={token}\n")
-
       - name: Send APNs via curl (HTTP/2)
         shell: bash
-        env:
-          JWT: ${{ steps.jwt.outputs.jwt }}
         run: |
           set -euo pipefail
-          echo "curl version (HTTP2 必須) ↓"
+
+          echo "curl version (HTTP/2 必須) ↓"
           curl -V
 
-          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
-          TOPIC="net.momo.CoreBluetoothLE"
-          HOST="https://api.sandbox.push.apple.com"
+          # Secrets の Base64 から PEM を再生成
+          P8_PEM="$(echo "$P8_BASE64" | base64 -d)"
 
-          CODE=$(curl --http2 -sS -o /tmp/body.json -w "%{http_code}" \
+          # JWT を Python で生成（ここも YAML 的に必ずインデント）
+          JWT=$(python3 - <<'PY'
+          import os, time, jwt
+          from cryptography.hazmat.primitives import serialization
+
+          team_id = os.environ["TEAM_ID"]
+          key_id  = os.environ["KEY_ID"]
+          pem     = os.environ["P8_PEM"]
+
+          priv = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+          token = jwt.encode({"iss": team_id, "iat": int(time.time())},
+                             priv, algorithm="ES256", headers={"kid": key_id})
+          print(token)
+          PY
+          )
+
+          echo "Built JWT length = ${#JWT}"
+
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # -f を付けると 4xx/5xx で即終了するので外す（本文とHTTPコードを自前で判定）
+          RESPONSE=$(curl --http2 -sS -w "\n%{http_code}" \
             -H "authorization: bearer ${JWT}" \
             -H "apns-topic: ${TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
-            -d '{"aps":{"content-available":1}}' \
+            -d "{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}" \
             "${HOST}/3/device/${TOKEN}")
 
-          echo "=== HTTP Status Code ==="; echo "$CODE"
-          echo "=== Response Body ===";   cat /tmp/body.json || true
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
-          if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
+          echo "=== Sent at: ${TIMESTAMP} ==="
+          echo "=== HTTP Status Code ==="
+          echo "$HTTP_CODE"
+          echo "=== Response Body ==="
+          echo "$BODY"
+
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
             echo "✅ Silent push sent successfully!"
           else
-            echo "❌ Failed to send push. Status: $CODE"
+            echo "❌ Failed to send push. Status: $HTTP_CODE"
             exit 1
           fi
+        env:
+          P8_PEM: ${{ env.P8_PEM }}  # 上の Python へ PEM を渡す
