@@ -1,66 +1,106 @@
 name: apns-every-5min
+
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # 5分ごと（UTC）
   workflow_dispatch: {}
+
+concurrency:
+  group: apns-every-5min
+  cancel-in-progress: true
+
 jobs:
   send:
     runs-on: ubuntu-latest
+
     env:
-      TEAM_ID:   ${{ secrets.APNS_TEAM_ID }}
-      KEY_ID:    ${{ secrets.APNS_KEY_ID }}
-      TOPIC:     ${{ secrets.APNS_TOPIC }}
-      TOKEN:     ${{ secrets.DEVICE_TOKENS }}
-      HOST:      https://api.sandbox.push.apple.com
+      TEAM_ID:    ${{ secrets.APNS_TEAM_ID }}
+      KEY_ID:     ${{ secrets.APNS_KEY_ID }}
+      TOPIC:      ${{ secrets.APNS_TOPIC }}
+      TOKENS:     ${{ secrets.DEVICE_TOKENS }}        # カンマ区切りOK
+      P8_BASE64:  ${{ secrets.APNS_P8_BASE64 }}        # 推奨：Base64一行
+      APNS_ENV:   ${{ secrets.APNS_ENV || 'sandbox' }} # sandbox / production
+
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
+        with:
+          python-version: '3.12'
+
       - name: Install deps
         run: |
           set -euo pipefail
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
 
-      - name: Write APNs key from multiline secret
+      - name: Restore .p8 from Base64
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          # ★ 複数行Secretを“そのまま”ファイル化（インデントしない・終端PEMは左端）
-          cat > apns_key.p8 <<'PEM'${{ secrets.APN_SECRETS }}PEM
-                    sed -i 's/\r$//' apns_key.p8
-          # 形式チェック（エラーならここで落とす）
+          echo "$P8_BASE64" | base64 -d > apns_key.p8
+          sed -i 's/\r$//' apns_key.p8
           openssl pkey -in apns_key.p8 -noout > /dev/null
-
-      - name: Build JWT & send via curl (HTTP/2)
+          
+      - name: Build JWT
+        id: jwt
         shell: bash
         run: |
           set -euo pipefail
           JWT=$(python - <<'PY'
-          import time, jwt
+          import os, time, jwt
           from cryptography.hazmat.primitives import serialization
-          with open("apns_key.p8", "rb") as f:
+          with open("apns_key.p8","rb") as f:
               priv = serialization.load_pem_private_key(f.read(), password=None)
-          token = jwt.encode({"iss":"${{ env.TEAM_ID }}","iat":int(time.time())},
-                             priv, algorithm="ES256", headers={"kid":"${{ env.KEY_ID }}"})
+          token = jwt.encode({"iss": os.environ["TEAM_ID"], "iat": int(time.time())},
+                             priv, algorithm="ES256", headers={"kid": os.environ["KEY_ID"]})
           print(token)
           PY
           )
-          echo "Built JWT length=${#JWT}"
-
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          RESP=$(curl --http2 -sS -w "\n%{http_code}" \
-            -H "authorization: bearer ${JWT}" \
-            -H "apns-topic: ${TOPIC}" \
-            -H "apns-push-type: background" \
-            -H "apns-priority: 5" \
-            -d "{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}" \
-            "${HOST}/3/device/${TOKEN}")
-          CODE=$(echo "$RESP" | tail -n1)
-          BODY=$(echo "$RESP" | sed '$d')
-          echo "=== HTTP $CODE ==="; echo "$BODY"
-          if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-            echo "✅ sent"
-          else
-            echo "❌ failed ($CODE)"; exit 1
+          echo "token=$JWT" >> "$GITHUB_OUTPUT"
+          
+      - name: Send to each device (HTTP/2 curl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="https://api.sandbox.push.apple.com"
+          if [ "${APNS_ENV}" = "production" ]; then
+            HOST="https://api.push.apple.com"
           fi
+
+          IFS=',' read -ra TOK_ARR <<< "$TOKENS"
+          COLLAPSE_ID="ble-ping"
+          EXPIRATION=$(date -u -d '+4 minutes' +%s)  # 4分で期限切れ
+
+          for RAW in "${TOK_ARR[@]}"; do
+            TOKEN="$(echo "$RAW" | xargs)"   # trim
+            [ -z "$TOKEN" ] && continue
+
+            SENT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            RESP=$(
+              curl --http2 -sS -i -w "\n%{http_code}" \
+                -H "authorization: bearer ${{
+                  steps.jwt.outputs.token
+                }}" \
+                -H "apns-topic: ${TOPIC}" \
+                -H "apns-push-type: background" \
+                -H "apns-priority: 5" \
+                -H "apns-collapse-id: ${COLLAPSE_ID}" \
+                -H "apns-expiration: ${EXPIRATION}" \
+                -d "{\"aps\":{\"content-available\":1},\"ts\":\"${SENT_AT}\"}" \
+                "${HOST}/3/device/${TOKEN}"
+            )
+            CODE=$(echo "$RESP" | tail -n1)
+            echo "=== Sent at: ${SENT_AT} -> HTTP $CODE ==="
+            echo "----- Response (headers+body) -----"
+            echo "$RESP" | sed '$d'
+            echo "-----------------------------------"
+
+            if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then
+              echo "❌ Failed for token: ${TOKEN:0:12}… (HTTP $CODE)"
+              exit 1
+            fi
+          done
+
+          echo "✅ All pushes sent"
