@@ -1,10 +1,8 @@
-name: send-silent-push-every-5min
+name: apns-every-5min
 on:
-  # 5分ごとに自動実行
   schedule:
-    - cron: '*/5 * * * *'
-  # 手動実行も可能
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"  # 5分ごと
+  workflow_dispatch: {}    # 手動実行も可能
 
 jobs:
   send:
@@ -23,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "🔔 Sending silent push at $(date)"
+          echo "🕐 $(date '+%Y-%m-%d %H:%M:%S') - Starting silent push"
           
           # JWT生成（インラインPython）
           JWT=$(python3 - <<'PY'
@@ -51,10 +49,16 @@ print(token)
 PY
           )
           
+          echo "Built JWT length = ${#JWT}"
+          
           # APNs送信設定
           TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
           TOPIC="net.momo.CoreBluetoothLE"
           HOST="https://api.sandbox.push.apple.com"
+          
+          # タイムスタンプを含むペイロード
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          PAYLOAD="{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}"
           
           # APNsへHTTP/2で送信
           RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
@@ -62,7 +66,7 @@ PY
             -H "apns-topic: ${TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
-            -d '{"aps":{"content-available":1},"timestamp":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"}' \
+            -d "${PAYLOAD}" \
             "${HOST}/3/device/${TOKEN}")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
@@ -75,7 +79,7 @@ PY
           
           # ステータスコードチェック
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Silent push sent successfully at $(date)"
+            echo "✅ Silent push sent successfully at ${TIMESTAMP}!"
           else
             echo "❌ Failed to send push. Status: $HTTP_CODE"
             exit 1
