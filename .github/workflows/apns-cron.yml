@@ -1,89 +1,66 @@
 name: apns-every-5min
-
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5分おき（UTC）
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
-
 jobs:
   send:
     runs-on: ubuntu-latest
-
     env:
-      TEAM_ID:    ${{ secrets.APNS_TEAM_ID }}
-      KEY_ID:     ${{ secrets.APNS_KEY_ID }}
-      TOPIC:      ${{ secrets.APNS_TOPIC }}
-      TOKEN:      ${{ secrets.DEVICE_TOKENS }}
-      P8_BASE64:  ${{ secrets.APNS_P8_BASE64 }}
-      HOST:       https://api.sandbox.push.apple.com   # 本番は https://api.push.apple.com
-
+      TEAM_ID:   ${{ secrets.APNS_TEAM_ID }}
+      KEY_ID:    ${{ secrets.APNS_KEY_ID }}
+      TOPIC:     ${{ secrets.APNS_TOPIC }}
+      TOKEN:     ${{ secrets.DEVICE_TOKENS }}
+      HOST:      https://api.sandbox.push.apple.com
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
+        with: { python-version: '3.12' }
       - name: Install deps
         run: |
           set -euo pipefail
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
 
-      - name: Send APNs via curl (HTTP/2)
+      - name: Write APNs key from multiline secret
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          # ★ 複数行Secretを“そのまま”ファイル化（インデントしない・終端PEMは左端）
+          cat > apns_key.p8 <<'PEM'${{ secrets.APN_SECRETS }}PEM
+                    sed -i 's/\r$//' apns_key.p8
+          # 形式チェック（エラーならここで落とす）
+          openssl pkey -in apns_key.p8 -noout > /dev/null
 
-          echo "curl version (HTTP/2 必須) ↓"
-          curl -V
-
-          # Secrets の Base64 から PEM を再生成
-          P8_PEM="$(echo "$P8_BASE64" | base64 -d)"
-
-          # JWT を Python で生成（ここも YAML 的に必ずインデント）
-          JWT=$(python3 - <<'PY'
-          import os, time, jwt
+      - name: Build JWT & send via curl (HTTP/2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          JWT=$(python - <<'PY'
+          import time, jwt
           from cryptography.hazmat.primitives import serialization
-
-          team_id = os.environ["TEAM_ID"]
-          key_id  = os.environ["KEY_ID"]
-          pem     = os.environ["P8_PEM"]
-
-          priv = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
-          token = jwt.encode({"iss": team_id, "iat": int(time.time())},
-                             priv, algorithm="ES256", headers={"kid": key_id})
+          with open("apns_key.p8", "rb") as f:
+              priv = serialization.load_pem_private_key(f.read(), password=None)
+          token = jwt.encode({"iss":"${{ env.TEAM_ID }}","iat":int(time.time())},
+                             priv, algorithm="ES256", headers={"kid":"${{ env.KEY_ID }}"})
           print(token)
           PY
           )
-
-          echo "Built JWT length = ${#JWT}"
+          echo "Built JWT length=${#JWT}"
 
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          # -f を付けると 4xx/5xx で即終了するので外す（本文とHTTPコードを自前で判定）
-          RESPONSE=$(curl --http2 -sS -w "\n%{http_code}" \
+          RESP=$(curl --http2 -sS -w "\n%{http_code}" \
             -H "authorization: bearer ${JWT}" \
             -H "apns-topic: ${TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
             -d "{\"aps\":{\"content-available\":1},\"timestamp\":\"${TIMESTAMP}\"}" \
             "${HOST}/3/device/${TOKEN}")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-
-          echo "=== Sent at: ${TIMESTAMP} ==="
-          echo "=== HTTP Status Code ==="
-          echo "$HTTP_CODE"
-          echo "=== Response Body ==="
-          echo "$BODY"
-
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Silent push sent successfully!"
+          CODE=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "=== HTTP $CODE ==="; echo "$BODY"
+          if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
+            echo "✅ sent"
           else
-            echo "❌ Failed to send push. Status: $HTTP_CODE"
-            exit 1
+            echo "❌ failed ($CODE)"; exit 1
           fi
-        env:
-          P8_PEM: ${{ env.P8_PEM }}  # 上の Python へ PEM を渡す
