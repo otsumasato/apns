@@ -1,0 +1,100 @@
+name: apns-cron
+on:
+  # 手動実行（Actions に Run workflow ボタンが出ます）
+  workflow_dispatch:
+    inputs:
+      device_token:
+        description: "Override device token (optional)"
+        required: false
+      env:
+        description: "APNs environment"
+        type: choice
+        options: [sandbox, production]
+        default: sandbox
+  # 5分ごとに自動実行（UTC）
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: apns-cron
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Install deps (JWT only)
+        run: |
+          python -V
+          pip install "PyJWT>=2.8" "cryptography>=42"
+
+      # 1) PythonでJWTを作る（shell: python はYAMLと衝突しにくい）
+      - name: Build JWT
+        id: jwt
+        shell: python
+        env:
+          APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
+          APNS_KEY_ID:  ${{ secrets.APNS_KEY_ID }}
+          APNS_P8_PEM:  ${{ secrets.APNS_P8_PEM }}
+        run: |
+          import time, os, jwt
+          from cryptography.hazmat.primitives import serialization
+          team_id = os.environ["APNS_TEAM_ID"].strip()
+          key_id  = os.environ["APNS_KEY_ID"].strip()
+          pem     = os.environ["APNS_P8_PEM"]
+          priv = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+          token = jwt.encode({"iss": team_id, "iat": int(time.time())}, priv,
+                             algorithm="ES256", headers={"kid": key_id})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"token={token}\n")
+
+      # 2) curl(HTTP/2)で送る（payloadにtickを入れると端末ログと突き合わせやすい）
+      - name: Send APNs via HTTP/2 (curl)
+        shell: bash
+        env:
+          JWT:            ${{ steps.jwt.outputs.token }}
+          APNS_TOPIC:     ${{ secrets.APNS_TOPIC }}
+          DEFAULT_TOKEN:  ${{ secrets.DEVICE_TOKENS }}
+          DEFAULT_ENV:    ${{ secrets.APNS_ENV }}
+          INPUT_TOKEN:    ${{ inputs.device_token }}
+          INPUT_ENV:      ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          echo "curl:"; curl -V
+
+          TOKEN="${INPUT_TOKEN:-${DEFAULT_TOKEN%%,*}}"
+          if [ -z "${TOKEN}" ]; then
+            echo "ERROR: device_token 未設定（入力 or DEVICE_TOKENS を設定）" >&2
+            exit 1
+          fi
+
+          ENV="${INPUT_ENV:-${DEFAULT_ENV:-sandbox}}"
+          if [ "${ENV}" = "production" ]; then
+            HOST="https://api.push.apple.com"
+          else
+            HOST="https://api.sandbox.push.apple.com"
+          fi
+
+          TICK_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "{\"aps\":{\"content-available\":1},\"tick\":\"${TICK_UTC}\"}" > body.json
+
+          echo "ENV=${ENV}  TOKEN(head)=${TOKEN:0:12}…  tick=${TICK_UTC}"
+
+          set -x
+          curl --http2 -sS -D headers.txt \
+            -H "authorization: bearer ${JWT}" \
+            -H "apns-topic: ${APNS_TOPIC}" \
+            -H "apns-push-type: background" \
+            -H "apns-priority: 5" \
+            -d @body.json \
+            "${HOST}/3/device/${TOKEN}" \
+            -o response.json
+          set +x
+
+          echo "=== Response Headers (1行目) ==="
+          head -n 1 headers.txt || true
+          echo "=== Response Body ==="
+          cat response.json || true
