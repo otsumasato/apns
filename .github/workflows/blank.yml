@@ -1,0 +1,81 @@
+name: blank
+on:
+  workflow_dispatch: {}
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install JWT deps
+        run: |
+          python -V
+          pip install "PyJWT>=2.8" "cryptography>=42"
+      
+      - name: Send APNs via curl (HTTP/2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "curl version (HTTP2 必須) ↓"
+          curl -V
+          
+          # JWT生成（インラインPython）
+          JWT=$(python3 - <<'PY'
+import time
+import jwt
+from cryptography.hazmat.primitives import serialization
+
+TEAM_ID = "8KVP2QK7BX"
+KEY_ID = "5W5TK89GQC"
+P8_PEM = """-----BEGIN PRIVATE KEY-----
+MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
+YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
+LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
+Mig6kHa4
+-----END PRIVATE KEY-----"""
+
+priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
+token = jwt.encode(
+    {"iss": TEAM_ID, "iat": int(time.time())}, 
+    priv,
+    algorithm="ES256", 
+    headers={"kid": KEY_ID}
+)
+print(token)
+PY
+          )
+          
+          echo "Built JWT length = ${#JWT}"
+          
+          # APNs送信設定
+          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
+          TOPIC="net.momo.CoreBluetoothLE"
+          HOST="https://api.sandbox.push.apple.com"
+          
+          # APNsへHTTP/2で送信
+          RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
+            -H "authorization: bearer ${JWT}" \
+            -H "apns-topic: ${TOPIC}" \
+            -H "apns-push-type: background" \
+            -H "apns-priority: 5" \
+            -d '{"aps":{"content-available":1}}' \
+            "${HOST}/3/device/${TOKEN}")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "=== HTTP Status Code ==="
+          echo "$HTTP_CODE"
+          echo "=== Response Body ==="
+          echo "$BODY"
+          
+          # ステータスコードチェック
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+            echo "✅ Silent push sent successfully!"
+          else
+            echo "❌ Failed to send push. Status: $HTTP_CODE"
+            exit 1
+          fi
