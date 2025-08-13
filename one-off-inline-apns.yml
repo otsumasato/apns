@@ -1,69 +1,121 @@
 name: one-off-inline-apns
 on:
-  workflow_dispatch:   #workflow_dispatch: {}   # ← これで Actions に「Run workflow」ボタンが出ます
-    inputs: …(省略)…
+  workflow_dispatch:
+    inputs:
+      device_token:
+        description: "Override device token (optional)"
+        required: false
+      env:
+        description: "APNs environment"
+        type: choice
+        options: [sandbox, production]
+        default: sandbox
   schedule:
-    - cron: "*/5 * * * *"   # 5分ごと
+    - cron: "*/5 * * * *"   # ← UTCで5分おき
+
 jobs:
   send:
     runs-on: ubuntu-latest
+    concurrency:
+      group: apns-cron
+      cancel-in-progress: true
+
     steps:
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'   # JWT作成だけなので 3.12 で安定
+        with: { python-version: '3.12' }
 
-      - name: Install JWT deps
+      - name: Install deps (JWT only)
         run: |
           python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
 
-      - name: Send APNs via curl (HTTP/2) — inline, no files
+      - name: Build JWT (shell: python)
+        id: jwt
+        shell: python
+        env:
+          APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
+          APNS_KEY_ID:  ${{ secrets.APNS_KEY_ID }}
+          APNS_P8_PEM:  ${{ secrets.APNS_P8_PEM }}
+        run: |
+          import time, os, jwt
+          from cryptography.hazmat.primitives import serialization
+          team_id = os.environ["APNS_TEAM_ID"].strip()
+          key_id  = os.environ["APNS_KEY_ID"].strip()
+          pem     = os.environ["APNS_P8_PEM"]
+          priv = serialization.load_pem_private_key(pem.encode(), None)
+          token = jwt.encode({"iss": team_id, "iat": int(time.time())}, priv,
+                             algorithm="ES256", headers={"kid": key_id})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"token={token}\n")
+
+      - name: Prepare payload tick (UTC & JST)
+        id: tick
         shell: bash
         run: |
+          NOW_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          NOW_JST=$(TZ=Asia/Tokyo date +"%Y-%m-%d %H:%M:%S %Z")
+          echo "tick=${NOW_UTC}" >> "$GITHUB_OUTPUT"
+          echo "nowjst=${NOW_JST}" >> "$GITHUB_OUTPUT"
+
+      - name: Send APNs via HTTP/2 (curl)
+        id: send
+        shell: bash
+        env:
+          JWT:           ${{ steps.jwt.outputs.token }}
+          APNS_TOPIC:    ${{ secrets.APNS_TOPIC }}
+          DEFAULT_TOKEN: ${{ secrets.DEVICE_TOKENS }}
+          DEFAULT_ENV:   ${{ secrets.APNS_ENV }}
+          INPUT_TOKEN:   ${{ inputs.device_token }}
+          INPUT_ENV:     ${{ inputs.env }}
+        run: |
           set -euo pipefail
-          echo "curl version (HTTP2 必須) ↓"
           curl -V
 
-          # === 1) JWT を Python で生成（あなたの値をハードコード） ===
-          JWT=$(
-python - <<'PY'
-import time, jwt
-from cryptography.hazmat.primitives import serialization
+          TOKEN="${INPUT_TOKEN:-${DEFAULT_TOKEN%%,*}}"
+          [ -n "${TOKEN}" ] || { echo "No device token"; exit 1; }
 
-TEAM_ID = "8KVP2QK7BX"
-KEY_ID  = "5W5TK89GQC"
-P8_PEM = """-----BEGIN PRIVATE KEY-----
-MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-Mig6kHa4
------END PRIVATE KEY-----"""
-priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-token = jwt.encode({"iss": TEAM_ID, "iat": int(time.time())}, priv,
-                   algorithm="ES256", headers={"kid": KEY_ID})
-print(token)
-PY
-          )
-          echo "Built JWT length = ${#JWT}"
+          ENV="${INPUT_ENV:-${DEFAULT_ENV:-sandbox}}"
+          [ "${ENV}" = "production" ] && HOST="https://api.push.apple.com" || HOST="https://api.sandbox.push.apple.com"
 
-          # === 2) あなたの送信先（開発 = sandbox） ===
-          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
-          TOPIC="net.momo.CoreBluetoothLE"
-          HOST="https://api.sandbox.push.apple.com"
+          TICK="${{ steps.tick.outputs.tick }}"
+          NOWJST="${{ steps.tick.outputs.nowjst }}"
 
-          # === 3) APNsへHTTP/2で送信（サイレントPush） ===
+          echo "ENV=${ENV} / JST=${NOWJST} / TICK=${TICK} / TOKEN(head)=${TOKEN:0:12}…"
+          # JSON に tick を埋めて送信（端末側で受信確認しやすい）
+          BODY=$(jq -n --arg t "$TICK" '{aps:{ "content-available":1 }, tick:$t}' )
+          echo "$BODY" > body.json
+
           set -x
-          curl --http2 -sS -D /tmp/headers.txt \
+          curl --http2 -sS -D headers.txt \
             -H "authorization: bearer ${JWT}" \
-            -H "apns-topic: ${TOPIC}" \
+            -H "apns-topic: ${APNS_TOPIC}" \
             -H "apns-push-type: background" \
             -H "apns-priority: 5" \
-            -d '{"aps":{"content-available":1}}' \
+            -d @body.json \
             "${HOST}/3/device/${TOKEN}" \
-            -o /tmp/body.json
+            -o response.json
           set +x
 
-          echo "=== Response Headers ==="
-          cat /tmp/headers.txt || true
-          echo "=== Response Body ==="
-          cat /tmp/body.json || true
+          # 成否とreason抽出（200以外なら reason が入る想定）
+          CODE=$(head -n1 headers.txt | awk '{print $2}')
+          REASON=$(jq -r '.reason // empty' response.json)
+          echo "code=${CODE}"   >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload run artifact (headers/body)
+        uses: actions/upload-artifact@v4
+        with:
+          name: apns-run-${{ github.run_id }}
+          path: |
+            headers.txt
+            response.json
+            body.json
+
+      - name: Append to job summary
+        run: |
+          {
+            echo "### APNs run"
+            echo "- JST time: **${{ steps.tick.outputs.nowjst }}**"
+            echo "- Tick(UTC): `${{ steps.tick.outputs.tick }}`"
+            echo "- Status: **${{ steps.send.outputs.code || 'N/A' }}**  Reason: `${{ steps.send.outputs.reason || '' }} `"
+          } >> "$GITHUB_STEP_SUMMARY"
