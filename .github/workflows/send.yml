@@ -17,17 +17,18 @@ jobs:
           pip install "PyJWT>=2.8" "cryptography>=42"
 
       - name: Write inline APNs key (PEM)
+        shell: bash
         run: |
           set -euo pipefail
           umask 077
-          cat > apns_key.p8 <<'PEM'
------BEGIN PRIVATE KEY-----
-MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-Mig6kHa4
------END PRIVATE KEY-----
-PEM
+          {
+          echo '-----BEGIN PRIVATE KEY-----'
+          echo 'MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w'
+          echo 'YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo'
+          echo 'LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt'
+          echo 'Mig6kHa4'
+          echo '-----END PRIVATE KEY-----'
+          } > apns_key.p8
           # CRLF対策 & 読めるか検証
           sed -i 's/\r$//' apns_key.p8
           openssl pkey -in apns_key.p8 -noout >/dev/null
