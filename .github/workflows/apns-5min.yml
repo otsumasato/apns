@@ -1,4 +1,4 @@
-name: apns-every-5min
+name: apns-every-10min
 
 on:
   schedule:
