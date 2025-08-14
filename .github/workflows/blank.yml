@@ -1,4 +1,4 @@
-name: one-time-apns
+name: one-time-apns-inline
 on:
   workflow_dispatch: {}
 
