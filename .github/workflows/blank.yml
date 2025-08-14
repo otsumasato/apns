@@ -51,7 +51,7 @@ jobs:
           echo "Built JWT length = ${#JWT}"
           
           # APNs送信設定
-          TOKEN="1163bccf16a01f9efae34df9ce464c56e7915cc4172b398640ee1fea581542be2"
+          TOKEN="163bccf16a01f9efae34df9ce464c56e7915cc4172b398640ee1fea581542be2"
           TOPIC="net.momo.CoreBluetoothLE"
           HOST="https://api.sandbox.push.apple.com"
           
