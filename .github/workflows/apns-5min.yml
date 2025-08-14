@@ -2,7 +2,7 @@ name: apns-every-5min
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5分ごと（UTC）※日本時間でも5分おきに動きます
+    - cron: "*/10 * * * *"   # 5分ごと（UTC）※日本時間でも5分おきに動きます
   workflow_dispatch: {}
 
 concurrency:
