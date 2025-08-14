@@ -29,7 +29,7 @@ jobs:
           ${APN_SECRETS}
           PEM
           openssl pkey -in apns_key.p8 -noout >/dev/null || { echo "Could not read key"; exit 1; }
-
+          
       - name: Build JWT
         id: jwt
         run: |
