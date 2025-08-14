@@ -94,7 +94,29 @@ jobs:
           IFS=',' read -ra TOK_ARR <<< "$TOKENS"
           COLLAPSE_ID="ble-ping"                               # 連投はcoalesce
           EXPIRATION=$(date -u -d '+4 minutes' +%s)            # 遅延対策で4分後に期限切れ
+          set -e
+          HOST="https://api.sandbox.push.apple.com"
+          [ "${APNS_ENV}" = "production" ] && HOST="https://api.push.apple.com"
 
+          IFS=',' read -ra A <<< "$TOKENS"
+          ok=1
+          for t in "${A[@]}"; do
+            t=$(echo "$t" | xargs)    # trim
+            [ -z "$t" ] && continue
+
+            code=$(curl --http2 -sS -o /dev/null -w "%{http_code}" \
+              -H "authorization: bearer ${{ steps.jwt.outputs.token }}" \
+              -H "apns-topic: ${TOPIC}" \
+              -H "apns-push-type: background" \
+              -H "apns-priority: 5" \
+              -d '{"aps":{"content-available":1}}' \
+              "${HOST}/3/device/${t}")
+
+            echo "${t:0:12}… => HTTP ${code}"
+            if [ "$code" != "200" ] && [ "$code" != "204" ]; then ok=0; fi
+          done
+
+          [ $ok -eq 1 ]
           for RAW in "${TOK_ARR[@]}"; do
             TOKEN="$(echo "$RAW" | xargs)"   # trim
             [ -z "$TOKEN" ] && continue
