@@ -1,73 +1,86 @@
-name: one-off-inline-apns
+name: apns-once
+
 on:
-  workflow_dispatch: {}   # Actions に Run workflow ボタンを出す
+  workflow_dispatch: {}
 
 jobs:
   send:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'   # JWT作成だけなので 3.12 が安定
+          python-version: '3.12'
 
       - name: Install deps
         run: |
-          python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
 
-      # 1) Python で JWT を作成（shell: python を使う＝YAMLと衝突しない）
-      - name: Build JWT
-        id: jwt
-        shell: python
-        run: |
-          import time, os, jwt
-          from cryptography.hazmat.primitives import serialization
-
-          # ==== あなたの値（ハードコードでまず通す） ====
-          TEAM_ID = "8KVP2QK7BX"
-          KEY_ID  = "5W5TK89GQC"
-          P8_PEM = """-----BEGIN PRIVATE KEY-----
-          MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-          YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-          LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-          Mig6kHa4
-          -----END PRIVATE KEY-----"""
-          # =============================================
-
-          private_key = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-          token = jwt.encode({"iss": TEAM_ID, "iat": int(time.time())},
-                             private_key, algorithm="ES256", headers={"kid": KEY_ID})
-
-          # 出力を次ステップに渡す
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"token={token}\n")
-
-      # 2) curl(HTTP/2) で APNs に送信
-      - name: Send APNs via HTTP/2 (curl)
-        shell: bash
-        env:
-          JWT: ${{ steps.jwt.outputs.token }}
+      - name: Write inline APNs key (PEM)
         run: |
           set -euo pipefail
-          echo "curl version:"
-          curl -V
+          umask 077
+          cat > apns_key.p8 <<'PEM'
+-----BEGIN PRIVATE KEY-----
+MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
+YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
+LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
+Mig6kHa4
+-----END PRIVATE KEY-----
+PEM
+          # CRLF対策 & 読めるか検証
+          sed -i 's/\r$//' apns_key.p8
+          openssl pkey -in apns_key.p8 -noout >/dev/null
+          echo "✅ APNs key OK"
 
-          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"   # 開発トークン
-          TOPIC="net.momo.CoreBluetoothLE"                                          # Bundle ID
-          HOST="https://api.sandbox.push.apple.com"                                  # TestFlight時は production に変更
+      - name: Build JWT
+        id: jwt
+        run: |
+          set -euo pipefail
+          python - <<'PY' > token.txt
+          import time, jwt
+          from cryptography.hazmat.primitives import serialization
+          TEAM_ID = "8KVP2QK7BX"
+          KEY_ID  = "5W5TK89GQC"
+          with open("apns_key.p8","rb") as f:
+              key = serialization.load_pem_private_key(f.read(), password=None)
+          token = jwt.encode(
+              {"iss": TEAM_ID, "iat": int(time.time())},
+              key, algorithm="ES256",
+              headers={"kid": KEY_ID}
+          )
+          print(token)
+          PY
+          echo "token=$(cat token.txt)" >> "$GITHUB_OUTPUT"
+          echo "Built JWT length = $(wc -c < token.txt)"
 
-          set -x
-          curl --http2 -sS -D /tmp/headers.txt \
-            -H "authorization: bearer ${JWT}" \
-            -H "apns-topic: ${TOPIC}" \
-            -H "apns-push-type: background" \
-            -H "apns-priority: 5" \
-            -d '{"aps":{"content-available":1}}' \
-            "${HOST}/3/device/${TOKEN}" \
-            -o /tmp/body.json
-          set +x
+      - name: Send one silent push (sandbox)
+        run: |
+          set -euo pipefail
+          HOST="https://api.sandbox.push.apple.com"   # ← sandbox 固定
+          TOPIC="net.momo.CoreBluetoothLE"
+          TOKEN="1163bccf16a01f9efae34df9ce464c56e7915cc4172b398640ee1fea581542be2"
 
-          echo "=== Response Headers ==="
-          cat /tmp/headers.txt || true
-          echo "=== Response Body ==="
-          cat /tmp/body.json || true
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RESP=$(
+            curl --http2 -sS -i -w "\n%{http_code}" \
+              -H "authorization: bearer ${{ steps.jwt.outputs.token }}" \
+              -H "apns-topic: ${TOPIC}" \
+              -H "apns-push-type: background" \
+              -H "apns-priority: 5" \
+              -d "{\"aps\":{\"content-available\":1},\"ts\":\"${TS}\"}" \
+              "${HOST}/3/device/${TOKEN}"
+          )
+
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "=== HTTP Status Code ==="
+          echo "$CODE"
+          echo "=== Response (headers+body) ==="
+          echo "$RESP" | sed '$d'
+
+          if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
+            echo "✅ Silent push sent successfully!"
+          else
+            echo "❌ Failed (HTTP $CODE)"
+            exit 1
+          fi
