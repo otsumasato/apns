@@ -1,70 +1,73 @@
-name: one-time-apns
+name: apns-pinger
 on:
+  schedule:
+    - cron: "*/10 * * * *"      # 10分おき
   workflow_dispatch: {}
+
+concurrency:
+  group: apns-pinger
+  cancel-in-progress: true
+
 jobs:
   send:
     runs-on: ubuntu-latest
+    env:
+      APNS_TEAM_ID:   ${{ secrets.APNS_TEAM_ID }}
+      APNS_KEY_ID:    ${{ secrets.APNS_KEY_ID }}
+      APNS_TOPIC:     ${{ secrets.APNS_TOPIC }}          # net.momo.CoreBluetoothLE
+      DEVICE_TOKENS:  ${{ secrets.DEVICE_TOKENS }}       # カンマ区切り可
+      APN_SECRETS:    ${{ secrets.APN_SECRETS }}         # -----BEGIN PRIVATE KEY----- ... END ...
+      APNS_ENV:       sandbox                            # TestFlight/本番は prod
     steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      
-      - name: Install JWT deps
+      - name: Install deps
         run: |
-          python -V
           pip install "PyJWT>=2.8" "cryptography>=42"
-      
-      - name: Send APNs via curl (HTTP/2)
-        shell: bash
+
+      - name: Write key
+        run: |
+          cat > apns_key.p8 <<'PEM'
+          ${APN_SECRETS}
+          PEM
+          openssl pkey -in apns_key.p8 -noout >/dev/null || { echo "Could not read key"; exit 1; }
+
+      - name: Build JWT
+        id: jwt
+        run: |
+          python - <<'PY' | tee jwt.txt
+          import time, jwt
+          from cryptography.hazmat.primitives import serialization
+          TEAM_ID="${APNS_TEAM_ID}"
+          KEY_ID="${APNS_KEY_ID}"
+          with open("apns_key.p8","rb") as f:
+              key = serialization.load_pem_private_key(f.read(), password=None)
+          print(jwt.encode({"iss": TEAM_ID, "iat": int(time.time())},
+                           key, algorithm="ES256", headers={"kid": KEY_ID}))
+          PY
+
+      - name: Send APNs (background)
         run: |
           set -euo pipefail
-          echo "curl version (HTTP2 必須) ↓"
-          curl -V
-          
-          # JWT生成（インラインPython）
-          JWT=$(python3 - <<'PY'
-          import time
-          import jwt
-          from cryptography.hazmat.primitives import serialization
-          TEAM_ID = "8KVP2QK7BX"
-          KEY_ID = "5W5TK89GQC"
-          P8_PEM = """-----BEGIN PRIVATE KEY-----
-          MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgfUyrzATs1Sjn4u9w
-          YeJH3LGx67sZPBoVJxHW3C7+dDWgCgYIKoZIzj0DAQehRANCAAQ+sq5rw5HiL6Jo
-          LsGWWVfDqTmnYR9LqkKWG3ea+7flLPbRo6UKyuRyQXZ/wrRmVMR+Q5IkrPt4ogIt
-          Mig6kHa4
-          -----END PRIVATE KEY-----"""
-          priv = serialization.load_pem_private_key(P8_PEM.encode("utf-8"), password=None)
-          token = jwt.encode({"iss": TEAM_ID, "iat": int(time.time())}, priv,algorithm="ES256", headers={"kid": KEY_ID})print(token)PY)
-          
-          echo "Built JWT length = ${#JWT}"
-          
-          # APNs送信設定
-          TOKEN="175946c5bde824e9d31e04660c640915323fa5cfcc15b316c5f1c8c026d1af80"
-          TOPIC="net.momo.CoreBluetoothLE"
-          HOST="https://api.sandbox.push.apple.com"
-          
-          # APNsへHTTP/2で送信
-          RESPONSE=$(curl --http2 -sSf -w "\n%{http_code}" \
-            -H "authorization: bearer ${JWT}" \
-            -H "apns-topic: ${TOPIC}" \
-            -H "apns-push-type: background" \
-            -H "apns-priority: 5" \
-            -d '{"aps":{"content-available":1}}' \
-            "${HOST}/3/device/${TOKEN}")
-          
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          
-          echo "=== HTTP Status Code ==="
-          echo "$HTTP_CODE"
-          echo "=== Response Body ==="
-          echo "$BODY"
-          
-          # ステータスコードチェック
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Silent push sent successfully!"
-          else
-            echo "❌ Failed to send push. Status: $HTTP_CODE"
-            exit 1
-          fi
+          JWT=$(cat jwt.txt)
+          HOST=$([ "${APNS_ENV}" = "prod" ] && echo "https://api.push.apple.com" || echo "https://api.sandbox.push.apple.com")
+          # 0〜90秒ランダムジッター（同時刻集中を避ける）
+          SLEEP=$((RANDOM % 91)); echo "jitter ${SLEEP}s"; sleep "${SLEEP}"
+          EXPIRES=$(( $(date +%s) + 900 ))   # 15分で期限切れ
+          TRACE=$(uuidgen)
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          IFS=, read -ra TOKENS <<< "${DEVICE_TOKENS}"
+          for T in "${TOKENS[@]}"; do
+            echo "=== send trace=$TRACE token=${T:0:8}... ==="
+            RESP=$(curl --http2 -sS -w "\n%{http_code}" \
+              -H "authorization: bearer ${JWT}" \
+              -H "apns-topic: ${APNS_TOPIC}" \
+              -H "apns-push-type: background" \
+              -H "apns-priority: 5" \
+              -H "apns-expiration: ${EXPIRES}" \
+              -H "apns-id: ${TRACE}" \
+              -d "{\"aps\":{\"content-available\":1},\"trace\":\"${TRACE}\",\"sent\":\"${NOW}\"}" \
+              "${HOST}/3/device/${T}" || true)
+            CODE=$(echo "$RESP" | tail -n1); BODY=$(echo "$RESP" | sed '$d')
+            echo "HTTP=$CODE BODY=$BODY"
+            [ "$CODE" = "200" ] || [ "$CODE" = "204" ] || exit 1
+          done
