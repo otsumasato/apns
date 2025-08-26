@@ -2,7 +2,7 @@ name: apns-every-15min
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # 15分ごと（UTC）
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -17,21 +17,18 @@ jobs:
       TEAM_ID:   ${{ secrets.APNS_TEAM_ID }}
       KEY_ID:    ${{ secrets.APNS_KEY_ID }}
       TOPIC:     ${{ secrets.APNS_TOPIC }}          # 例: com.momo.BluetoothLE-APP
-      TOKENS:    ${{ secrets.DEVICE_TOKENS }}       # 複数可（カンマ/空白/改行区切りOK）
-      APNS_ENV:  ${{ secrets.APNS_ENV || 'production' }}  # 'production' で本番
-      KEY_PEM:   ${{ secrets.APNS_P8_PEM }}         # PEM貼り付け or
-      KEY_B64:   ${{ secrets.APNS_P8_BASE64 }}      # Base64のどちらか
+      TOKENS:    ${{ secrets.DEVICE_TOKENS }}       # カンマ/空白/改行で複数OK
+      APNS_ENV:  ${{ secrets.APNS_ENV || 'production' }}
+      KEY_PEM:   ${{ secrets.APNS_P8_PEM }}         # PEM全文 or
+      KEY_B64:   ${{ secrets.APNS_P8_BASE64 }}      # Base64 1行のどちらか
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
-      - name: Install deps
+      - name: Install deps (curl/openssl は既に入っている想定)
         run: |
           set -euo pipefail
-          pip install "PyJWT>=2.8" "cryptography>=42"
+          openssl version
 
       - name: Create APNs key file (PEM or Base64)
         shell: bash
@@ -46,58 +43,67 @@ jobs:
             echo "❌ APNs key not provided"; exit 1
           fi
           sed -i 's/\r$//' apns_key.p8
+          # 鍵の健全性チェック
           openssl pkey -in apns_key.p8 -noout >/dev/null || { echo "❌ invalid key"; exit 1; }
 
-      - name: Build JWT
+      - name: Build JWT (OpenSSL only)
         id: jwt
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY' | tee jwt.txt
-          import os, time, jwt
-          from cryptography.hazmat.primitives import serialization
-          with open("apns_key.p8","rb") as f:
-          priv = serialization.load_pem_private_key(f.read(), password=None)
-          token = jwt.encode(
-          {"iss": os.environ["TEAM_ID"], "iat": int(time.time())},
-          priv, algorithm="ES256", headers={"kid": os.environ["KEY_ID"]}
+          IAT=$(date +%s)
+
+          # ヘッダ/クレームを base64url で作成
+          HEADER=$(printf '{"alg":"ES256","kid":"%s"}' "$KEY_ID" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          CLAIM=$(printf '{"iss":"%s","iat":%d}' "$TEAM_ID" "$IAT" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
+          # 署名（ES256）→ base64url
+          SIG=$(
+            printf '%s.%s' "$HEADER" "$CLAIM" |
+            openssl dgst -sha256 -sign apns_key.p8 -binary |
+            openssl base64 -A | tr '+/' '-_' | tr -d '='
           )
-          print(token)
-          PY
-          echo "token=$(cat jwt.txt)" >> "$GITHUB_OUTPUT"
-          
+
+          JWT="$HEADER.$CLAIM.$SIG"
+          echo "$JWT" | tee jwt.txt
+          echo "token=$JWT" >> "$GITHUB_OUTPUT"
+
       - name: Send pushes (show reason on error)
         shell: bash
         run: |
-         set -euo pipefail
-         HOST="https://api.sandbox.push.apple.com"
-         [ "${APNS_ENV}" = "production" ] && HOST="https://api.push.apple.com"
-         TOKENS_NORM=$(echo "$TOKENS" | tr '\n' ',' | tr ' ' ',' | tr -s ',')
-         IFS=',' read -ra ARR <<< "$TOKENS_NORM"
-         COLLAPSE_ID=ble-ping
-         EXPIRATION=$(date -u -d '+4 minutes' +%s)
-         all_ok=1
-         for tok in "${ARR[@]}"; do
-         tok=$(echo "$tok" | xargs); [ -z "$tok" ] && continue
-         
-         echo ">>> POST ${HOST}/3/device/${tok:0:12}…"
-         RESP=$(
-         curl --http2 -sS -i -w "\n%{http_code}" \
-          -H "authorization: bearer ${{ steps.jwt.outputs.token }}" \
-          -H "apns-topic: ${TOPIC}" \
-          -H "apns-push-type: background" \
-          -H "apns-priority: 5" \
-          -H "apns-collapse-id: ${COLLAPSE_ID}" \
-          -H "apns-expiration: ${EXPIRATION}" \
-          -d '{"aps":{"content-available":1}}' \
-          "${HOST}/3/device/${tok}"
-          )
-          
-          CODE=$(echo "$RESP" | tail -n1)
-          echo "$RESP" | sed '$d'        # ヘッダー＋本文（reason）を表示
-          echo "<<< HTTP $CODE"
-          if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then all_ok=0; fi
-          done
-          
-          [ $all_ok -eq 1 ] || exit 1
+          set -euo pipefail
 
+          HOST="https://api.sandbox.push.apple.com"
+          [ "${APNS_ENV}" = "production" ] && HOST="https://api.push.apple.com"
+
+          # 複数トークンを正規化（カンマ/空白/改行 → カンマ）
+          TOKENS_NORM=$(echo "$TOKENS" | tr '\n' ',' | tr ' ' ',' | tr -s ',')
+          IFS=',' read -ra ARR <<< "$TOKENS_NORM"
+
+          COLLAPSE_ID=ble-ping
+          EXPIRATION=$(date -u -d '+4 minutes' +%s)
+
+          all_ok=1
+          for tok in "${ARR[@]}"; do
+            tok=$(echo "$tok" | xargs); [ -z "$tok" ] && continue
+
+            echo ">>> POST ${HOST}/3/device/${tok:0:12}…"
+            RESP=$(
+              curl --http2 -sS -i -w "\n%{http_code}" \
+                -H "authorization: bearer ${{ steps.jwt.outputs.token }}" \
+                -H "apns-topic: ${TOPIC}" \
+                -H "apns-push-type: background" \
+                -H "apns-priority: 5" \
+                -H "apns-collapse-id: ${COLLAPSE_ID}" \
+                -H "apns-expiration: ${EXPIRATION}" \
+                -d '{"aps":{"content-available":1}}' \
+                "${HOST}/3/device/${tok}"
+            )
+
+            CODE=$(echo "$RESP" | tail -n1)
+            echo "$RESP" | sed '$d'    # ← ヘッダー＋本文（reason）を表示
+            echo "<<< HTTP $CODE"
+            if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then all_ok=1&&false || all_ok=0; fi
+          done
+
+          [ $all_ok -eq 1 ] || exit 1
