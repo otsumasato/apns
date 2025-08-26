@@ -54,39 +54,35 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY' | tee jwt.txt
-import os, time, jwt
-from cryptography.hazmat.primitives import serialization
-with open("apns_key.p8","rb") as f:
-    priv = serialization.load_pem_private_key(f.read(), password=None)
-token = jwt.encode(
-    {"iss": os.environ["TEAM_ID"], "iat": int(time.time())},
-    priv, algorithm="ES256", headers={"kid": os.environ["KEY_ID"]}
-)
-print(token)
-PY
+          import os, time, jwt
+          from cryptography.hazmat.primitives import serialization
+          with open("apns_key.p8","rb") as f:
+          priv = serialization.load_pem_private_key(f.read(), password=None)
+          token = jwt.encode(
+          {"iss": os.environ["TEAM_ID"], "iat": int(time.time())},
+          priv, algorithm="ES256", headers={"kid": os.environ["KEY_ID"]}
+          )
+          print(token)
+          PY
           echo "token=$(cat jwt.txt)" >> "$GITHUB_OUTPUT"
-
-- name: Send pushes (show reason on error)
-  shell: bash
-  run: |
-    set -euo pipefail
-    HOST="https://api.sandbox.push.apple.com"
-    [ "${APNS_ENV}" = "production" ] && HOST="https://api.push.apple.com"
-
-    # 複数トークンを正規化（カンマ/空白/改行 → カンマ）
-    TOKENS_NORM=$(echo "$TOKENS" | tr '\n' ',' | tr ' ' ',' | tr -s ',')
-    IFS=',' read -ra ARR <<< "$TOKENS_NORM"
-
-    COLLAPSE_ID=ble-ping
-    EXPIRATION=$(date -u -d '+4 minutes' +%s)
-
-    all_ok=1
-    for tok in "${ARR[@]}"; do
-      tok=$(echo "$tok" | xargs); [ -z "$tok" ] && continue
-
-      echo ">>> POST ${HOST}/3/device/${tok:0:12}…"
-      RESP=$(
-        curl --http2 -sS -i -w "\n%{http_code}" \
+          
+      - name: Send pushes (show reason on error)
+        shell: bash
+        run: |
+         set -euo pipefail
+         HOST="https://api.sandbox.push.apple.com"
+         [ "${APNS_ENV}" = "production" ] && HOST="https://api.push.apple.com"
+         TOKENS_NORM=$(echo "$TOKENS" | tr '\n' ',' | tr ' ' ',' | tr -s ',')
+         IFS=',' read -ra ARR <<< "$TOKENS_NORM"
+         COLLAPSE_ID=ble-ping
+         EXPIRATION=$(date -u -d '+4 minutes' +%s)
+         all_ok=1
+         for tok in "${ARR[@]}"; do
+         tok=$(echo "$tok" | xargs); [ -z "$tok" ] && continue
+         
+         echo ">>> POST ${HOST}/3/device/${tok:0:12}…"
+         RESP=$(
+         curl --http2 -sS -i -w "\n%{http_code}" \
           -H "authorization: bearer ${{ steps.jwt.outputs.token }}" \
           -H "apns-topic: ${TOPIC}" \
           -H "apns-push-type: background" \
@@ -95,13 +91,13 @@ PY
           -H "apns-expiration: ${EXPIRATION}" \
           -d '{"aps":{"content-available":1}}' \
           "${HOST}/3/device/${tok}"
-      )
-
-      CODE=$(echo "$RESP" | tail -n1)
-      echo "$RESP" | sed '$d'        # ヘッダー＋本文（reason）を表示
-      echo "<<< HTTP $CODE"
-      if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then all_ok=0; fi
-    done
-
-    [ $all_ok -eq 1 ] || exit 1
+          )
+          
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "$RESP" | sed '$d'        # ヘッダー＋本文（reason）を表示
+          echo "<<< HTTP $CODE"
+          if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then all_ok=0; fi
+          done
+          
+          [ $all_ok -eq 1 ] || exit 1
 
