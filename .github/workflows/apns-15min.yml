@@ -18,7 +18,7 @@ jobs:
       KEY_ID:    ${{ secrets.APNS_KEY_ID }}
       TOPIC:     ${{ secrets.APNS_TOPIC }}          # 例: com.momo.BluetoothLE-APP
       TOKENS:    ${{ secrets.DEVICE_TOKENS }}       # カンマ/空白/改行で複数OK
-      APNS_ENV:  ${{ secrets.APNS_ENV || 'sandbox' }} #production
+      APNS_ENV:  ${{ secrets.APNS_ENV || 'production' }} #production
       KEY_PEM:   ${{ secrets.APNS_P8_PEM }}         # PEM全文 or
       KEY_B64:   ${{ secrets.APNS_P8_BASE64 }}      # Base64 1行のどちらか
 
