@@ -1,12 +1,12 @@
-name: apns-every-5min
+name: apns-every-15min
 
 on:
   schedule:
-    - cron: "*/20 * * * *"   # 5分ごと（UTC）
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 concurrency:
-  group: apns-every-5min
+  group: apns-every-15min
   cancel-in-progress: true
 
 jobs:
@@ -14,93 +14,96 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      TEAM_ID:    ${{ secrets.APNS_TEAM_ID }}
-      KEY_ID:     ${{ secrets.APNS_KEY_ID }}
-      TOPIC:      ${{ secrets.APNS_TOPIC }}
-      TOKENS:     ${{ secrets.DEVICE_TOKENS }}        # カンマ区切りOK
-      P8_BASE64:  ${{ secrets.APNS_P8_BASE64 }}        # 推奨：Base64一行
-      APNS_ENV:   ${{ secrets.APNS_ENV || 'sandbox' }} # sandbox / production
+      TEAM_ID:   ${{ secrets.APNS_TEAM_ID }}
+      KEY_ID:    ${{ secrets.APNS_KEY_ID }}
+      TOPIC:     ${{ secrets.APNS_TOPIC }}          # 例: com.momo.BluetoothLE-APP
+      TOKENS:    ${{ secrets.DEVICE_TOKENS }}       # カンマ/空白/改行で複数OK
+      APNS_ENV:  ${{ secrets.APNS_ENV || 'production' }} #production
+      KEY_PEM:   ${{ secrets.APNS_P8_PEM }}         # PEM全文 or
+      KEY_B64:   ${{ secrets.APNS_P8_BASE64 }}      # Base64 1行のどちらか
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install deps
+      - name: Install deps (curl/openssl は既に入っている想定)
         run: |
           set -euo pipefail
-          python -V
-          pip install "PyJWT>=2.8" "cryptography>=42"
+          openssl version
 
-      - name: Restore .p8 from Base64
+      - name: Create APNs key file (PEM or Base64)
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          echo "$P8_BASE64" | base64 -d > apns_key.p8
+          if [ -n "${KEY_PEM:-}" ]; then
+            printf '%s\n' "$KEY_PEM" > apns_key.p8
+          elif [ -n "${KEY_B64:-}" ]; then
+            echo "$KEY_B64" | tr -d '\n' | base64 -d > apns_key.p8
+          else
+            echo "❌ APNs key not provided"; exit 1
+          fi
           sed -i 's/\r$//' apns_key.p8
-          openssl pkey -in apns_key.p8 -noout > /dev/null
-          
-      - name: Build JWT
+          # 鍵の健全性チェック
+          openssl pkey -in apns_key.p8 -noout >/dev/null || { echo "❌ invalid key"; exit 1; }
+
+      - name: Build JWT (OpenSSL only)
         id: jwt
         shell: bash
         run: |
           set -euo pipefail
-          JWT=$(python - <<'PY'
-          import os, time, jwt
-          from cryptography.hazmat.primitives import serialization
-          with open("apns_key.p8","rb") as f:
-              priv = serialization.load_pem_private_key(f.read(), password=None)
-          token = jwt.encode({"iss": os.environ["TEAM_ID"], "iat": int(time.time())},
-                             priv, algorithm="ES256", headers={"kid": os.environ["KEY_ID"]})
-          print(token)
-          PY
+          IAT=$(date +%s)
+
+          # ヘッダ/クレームを base64url で作成
+          HEADER=$(printf '{"alg":"ES256","kid":"%s"}' "$KEY_ID" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          CLAIM=$(printf '{"iss":"%s","iat":%d}' "$TEAM_ID" "$IAT" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
+          # 署名（ES256）→ base64url
+          SIG=$(
+            printf '%s.%s' "$HEADER" "$CLAIM" |
+            openssl dgst -sha256 -sign apns_key.p8 -binary |
+            openssl base64 -A | tr '+/' '-_' | tr -d '='
           )
+
+          JWT="$HEADER.$CLAIM.$SIG"
+          echo "$JWT" | tee jwt.txt
           echo "token=$JWT" >> "$GITHUB_OUTPUT"
-          
-      - name: Send to each device (HTTP/2 curl)
+
+      - name: Send pushes (show reason on error)
         shell: bash
         run: |
           set -euo pipefail
+
           HOST="https://api.sandbox.push.apple.com"
-          if [ "${APNS_ENV}" = "production" ]; then
-            HOST="https://api.push.apple.com"
-          fi
+          [ "${APNS_ENV}" = "production" ] && HOST="https://api.push.apple.com"
 
-          IFS=',' read -ra TOK_ARR <<< "$TOKENS"
-          COLLAPSE_ID="ble-ping"
-          EXPIRATION=$(date -u -d '+4 minutes' +%s)  # 4分で期限切れ
+          # 複数トークンを正規化（カンマ/空白/改行 → カンマ）
+          TOKENS_NORM=$(echo "$TOKENS" | tr '\n' ',' | tr ' ' ',' | tr -s ',')
+          IFS=',' read -ra ARR <<< "$TOKENS_NORM"
 
-          for RAW in "${TOK_ARR[@]}"; do
-            TOKEN="$(echo "$RAW" | xargs)"   # trim
-            [ -z "$TOKEN" ] && continue
+          COLLAPSE_ID=ble-ping
+          EXPIRATION=$(date -u -d '+4 minutes' +%s)
 
-            SENT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          all_ok=1
+          for tok in "${ARR[@]}"; do
+            tok=$(echo "$tok" | xargs); [ -z "$tok" ] && continue
+
+            echo ">>> POST ${HOST}/3/device/${tok:0:12}…"
             RESP=$(
               curl --http2 -sS -i -w "\n%{http_code}" \
-                -H "authorization: bearer ${{
-                  steps.jwt.outputs.token
-                }}" \
+                -H "authorization: bearer ${{ steps.jwt.outputs.token }}" \
                 -H "apns-topic: ${TOPIC}" \
                 -H "apns-push-type: background" \
                 -H "apns-priority: 5" \
                 -H "apns-collapse-id: ${COLLAPSE_ID}" \
                 -H "apns-expiration: ${EXPIRATION}" \
-                -d "{\"aps\":{\"content-available\":1},\"ts\":\"${SENT_AT}\"}" \
-                "${HOST}/3/device/${TOKEN}"
+                -d '{"aps":{"content-available":1}}' \
+                "${HOST}/3/device/${tok}"
             )
-            CODE=$(echo "$RESP" | tail -n1)
-            echo "=== Sent at: ${SENT_AT} -> HTTP $CODE ==="
-            echo "----- Response (headers+body) -----"
-            echo "$RESP" | sed '$d'
-            echo "-----------------------------------"
 
-            if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then
-              echo "❌ Failed for token: ${TOKEN:0:12}… (HTTP $CODE)"
-              exit 1
-            fi
+            CODE=$(echo "$RESP" | tail -n1)
+            echo "$RESP" | sed '$d'    # ← ヘッダー＋本文（reason）を表示
+            echo "<<< HTTP $CODE"
+            if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then all_ok=1&&false || all_ok=0; fi
           done
 
-          echo "✅ All pushes sent"
+          [ $all_ok -eq 1 ] || exit 1
